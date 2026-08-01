@@ -1,6 +1,7 @@
 package banexg
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -31,6 +32,7 @@ type WsClient struct {
 	Exg           *Exchange
 	conns         map[int]*AsyncConn
 	URL           string
+	LogURL        string
 	AccName       string
 	MarketType    string
 	Key           string
@@ -60,37 +62,54 @@ type AsyncConn struct {
 }
 
 type WebSocket struct {
-	conn        *websocket.Conn // nil表示禁用
-	lock        *deadlock.RWMutex
-	url         string
-	dialer      *websocket.Dialer
-	onReConnect func() *errs.Error
-	id          int
+	conn          *websocket.Conn // nil表示断开
+	lock          *deadlock.RWMutex
+	url           string
+	logURL        string
+	dialer        *websocket.Dialer
+	onReConnect   func() *errs.Error
+	id            int
+	closed        bool
+	stop          chan struct{}
+	reconnectLock deadlock.Mutex
+	dial          func() (*websocket.Conn, error)
+	waitReconnect func(time.Duration) bool
 }
 
+type permanentWsDialError struct{ error }
+
 func (ws *WebSocket) Close() error {
-	if ws.conn != nil {
-		ws.lock.Lock()
-		var err error
-		if ws.conn != nil {
-			err = ws.conn.Close()
-			ws.conn = nil
+	ws.lock.Lock()
+	if !ws.closed {
+		ws.closed = true
+		if ws.stop != nil {
+			close(ws.stop)
 		}
-		ws.lock.Unlock()
-		return err
+	}
+	conn := ws.conn
+	ws.conn = nil
+	ws.lock.Unlock()
+	if conn != nil {
+		return conn.Close()
 	}
 	return nil
 }
 
 func (ws *WebSocket) WriteClose() error {
-	conn, lock := ws.readConn()
-	var err error
+	ws.lock.Lock()
+	if !ws.closed {
+		ws.closed = true
+		if ws.stop != nil {
+			close(ws.stop)
+		}
+	}
+	conn := ws.conn
+	ws.lock.Unlock()
 	if conn != nil {
 		exitData := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
-		err = conn.WriteMessage(websocket.CloseMessage, exitData)
+		return conn.WriteMessage(websocket.CloseMessage, exitData)
 	}
-	lock.RUnlock()
-	return err
+	return nil
 }
 
 func (ws *WebSocket) readConn() (*websocket.Conn, *deadlock.RWMutex) {
@@ -99,24 +118,20 @@ func (ws *WebSocket) readConn() (*websocket.Conn, *deadlock.RWMutex) {
 }
 
 func (ws *WebSocket) reConnect() error {
-	err_ := ws.initConn()
-	if err_ != nil {
-		return err_
-	}
-	log.Info("reconnect success", zap.String("url", ws.url), zap.Int("id", ws.id))
-	if ws.onReConnect != nil {
-		err2 := ws.onReConnect()
-		if err2 != nil {
-			return err2
-		}
-	}
-	return nil
+	return ws.connectWithRetry(true)
 }
 
 func (ws *WebSocket) ReConnect() error {
-	var err = ws.Close()
+	ws.lock.Lock()
+	conn := ws.conn
+	ws.conn = nil
+	ws.lock.Unlock()
+	var err error
+	if conn != nil {
+		err = conn.Close()
+	}
 	if err != nil {
-		log.Warn("close ws conn fail", zap.String("url", ws.url), zap.Int("id", ws.id), zap.Error(err))
+		log.Warn("close ws conn fail", zap.String("url", ws.logURL), zap.Int("id", ws.id), zap.Error(err))
 	}
 	return ws.reConnect()
 }
@@ -128,76 +143,46 @@ func (ws *WebSocket) NextWriter() (io.WriteCloser, error) {
 	if conn != nil {
 		writer, err = conn.NextWriter(websocket.TextMessage)
 	} else {
-		err = fmt.Errorf("ws conn [%d] %s closed, NextWriter fail", ws.id, ws.url)
+		err = fmt.Errorf("ws conn [%d] %s closed, NextWriter fail", ws.id, ws.logURL)
 	}
 	lock.RUnlock()
 	return writer, err
 }
 
 func (ws *WebSocket) ReadMsg() ([]byte, error) {
-	var msgType int
-	var msgRaw []byte
-	var err error
 	for {
 		conn, lock := ws.readConn()
-		if conn != nil {
-			msgType, msgRaw, err = conn.ReadMessage()
-		} else {
-			msgType = -1
-		}
+		closed := ws.closed
 		lock.RUnlock()
-		if msgType < 0 && err == nil {
+		if closed {
 			return nil, errors.New("ws conn closed, read fail")
 		}
+		if conn == nil {
+			if err := ws.connectWithRetry(true); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		msgType, msgRaw, err := conn.ReadMessage()
 		if err != nil {
-			var closeErr *websocket.CloseError
-			var wait time.Duration
-			var tryReConn = false
-			var code = -1
-			var errText = err.Error()
-			if errors.As(err, &closeErr) {
-				// Closed, no further use allowed
-				// 已关闭，禁止继续使用
-				code = closeErr.Code
-				tryReConn = true
-				if code == 1006 || code == 1011 || code == 1012 || code == 1013 {
-					if code == 1013 {
-						// 等10s重试
-						wait = time.Millisecond * 10000
-					} else {
-						wait = time.Millisecond * 500
-					}
-				} else if code == 1008 && strings.Contains(errText, "Pong timeout") {
-					wait = time.Millisecond * 500
-				} else {
-					wait = time.Millisecond * 1000
-				}
-			} else if strings.Contains(errText, "EOF") || strings.Contains(errText, "connection timed out") ||
-				strings.Contains(errText, "connection reset") || strings.Contains(errText, "closed by") {
-				tryReConn = true
-				wait = time.Millisecond * 500
+			ws.lock.Lock()
+			if ws.conn == conn {
+				ws.conn = nil
 			}
-			if tryReConn {
-				// 连接不可用，提前锁定
-				ws.lock.Lock()
+			closed = ws.closed
+			ws.lock.Unlock()
+			_ = conn.Close()
+			if closed {
+				return nil, err
 			}
-			if wait > 0 {
-				time.Sleep(wait)
+			log.Info("websocket disconnected, reconnecting", zap.String("url", ws.logURL),
+				zap.Int("id", ws.id), zap.Error(err))
+			if err = ws.connectWithRetry(true); err != nil {
+				return nil, err
 			}
-			if tryReConn {
-				log.Info(fmt.Sprintf("[%v] ws %v closed, reconnecting: %s, err: %T %v", code, ws.id, ws.url, err, errText))
-				err_ := ws.reConnect()
-				if err_ != nil {
-					// 重连失败，禁用
-					ws.conn = nil
-					ws.lock.Unlock()
-					return nil, err_
-				}
-				ws.lock.Unlock()
-				return ws.ReadMsg()
-			}
-			return nil, err
-		} else if msgType == websocket.TextMessage {
+			continue
+		}
+		if msgType == websocket.TextMessage {
 			return msgRaw, nil
 		}
 	}
@@ -211,12 +196,88 @@ func (ws *WebSocket) IsOK() bool {
 }
 
 func (ws *WebSocket) initConn() error {
-	conn, _, err := ws.dialer.Dial(ws.url, http.Header{})
+	conn, err := ws.dial()
 	if err != nil {
 		return err
 	}
+	if conn == nil {
+		return errors.New("websocket dial returned no connection")
+	}
+	ws.lock.Lock()
+	if ws.closed {
+		ws.lock.Unlock()
+		_ = conn.Close()
+		return errors.New("websocket closed")
+	}
 	ws.conn = conn
+	ws.lock.Unlock()
 	return nil
+}
+
+var reconnectDelays = [...]time.Duration{3 * time.Second, 6 * time.Second, 12 * time.Second, 30 * time.Second}
+
+func (ws *WebSocket) connectWithRetry(callHook bool) error {
+	ws.reconnectLock.Lock()
+	defer ws.reconnectLock.Unlock()
+	if callHook {
+		conn, lock := ws.readConn()
+		lock.RUnlock()
+		if conn != nil {
+			return nil
+		}
+	}
+	for attempt := 0; ; attempt++ {
+		ws.lock.RLock()
+		closed := ws.closed
+		ws.lock.RUnlock()
+		if closed {
+			return errors.New("websocket closed")
+		}
+		err := ws.initConn()
+		if err == nil {
+			if callHook && ws.onReConnect != nil {
+				if hookErr := ws.onReConnect(); hookErr != nil {
+					permanent := isPermanentWsError(hookErr)
+					ws.lock.Lock()
+					conn := ws.conn
+					ws.conn = nil
+					ws.lock.Unlock()
+					if conn != nil {
+						_ = conn.Close()
+					}
+					if permanent {
+						return hookErr
+					}
+				} else {
+					log.Info("reconnect success", zap.String("url", ws.logURL), zap.Int("id", ws.id))
+					return nil
+				}
+			} else {
+				return nil
+			}
+		} else {
+			var permanent *permanentWsDialError
+			if errors.As(err, &permanent) {
+				return err
+			}
+		}
+		wait := reconnectDelays[min(attempt, len(reconnectDelays)-1)]
+		if ws.waitReconnect != nil {
+			if !ws.waitReconnect(wait) {
+				return errors.New("websocket reconnect stopped")
+			}
+			continue
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-timer.C:
+		case <-ws.stop:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return errors.New("websocket closed")
+		}
+	}
 }
 
 func (ws *WebSocket) GetID() int {
@@ -227,7 +288,7 @@ func (ws *WebSocket) SetID(v int) {
 	ws.id = v
 }
 
-func newWebSocket(id int, reqUrl string, args map[string]interface{}, onReConnect func() *errs.Error) (*AsyncConn, *errs.Error) {
+func newWebSocket(id int, reqUrl, logURL string, args map[string]interface{}, onReConnect func() *errs.Error) (*AsyncConn, *errs.Error) {
 	var dialer = &websocket.Dialer{}
 	dialer.HandshakeTimeout = utils.GetMapVal(args, ParamHandshakeTimeout, time.Second*15)
 	var defProxy func(*http.Request) (*url.URL, error)
@@ -235,9 +296,17 @@ func newWebSocket(id int, reqUrl string, args map[string]interface{}, onReConnec
 	if proxy != nil {
 		dialer.Proxy = proxy
 	}
-	res := &WebSocket{id: id, dialer: dialer, url: reqUrl, onReConnect: onReConnect}
+	res := &WebSocket{id: id, dialer: dialer, url: reqUrl, logURL: logURL, onReConnect: onReConnect,
+		stop: make(chan struct{})}
 	res.lock = &deadlock.RWMutex{}
-	err := res.initConn()
+	res.dial = func() (*websocket.Conn, error) {
+		conn, rsp, err := dialer.Dial(reqUrl, http.Header{})
+		if err != nil && isPermanentWsDialError(err, rsp) {
+			return nil, &permanentWsDialError{error: err}
+		}
+		return conn, err
+	}
+	err := res.connectWithRetry(false)
 	if err != nil {
 		return nil, errs.New(errs.CodeConnectFail, err)
 	}
@@ -246,6 +315,28 @@ func newWebSocket(id int, reqUrl string, args map[string]interface{}, onReConnec
 		send:    make(chan []byte, 10),
 		control: make(chan int, 2),
 	}, nil
+}
+
+func isPermanentWsDialError(err error, rsp *http.Response) bool {
+	if rsp != nil && rsp.StatusCode >= 400 && rsp.StatusCode < 500 && rsp.StatusCode != http.StatusTooManyRequests {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "malformed ws or wss url") || strings.Contains(text, "missing protocol scheme") ||
+		strings.Contains(text, "unsupported protocol scheme")
+}
+
+func isPermanentWsError(err *errs.Error) bool {
+	if err == nil {
+		return false
+	}
+	switch err.Code {
+	case errs.CodeUnauthorized, errs.CodeForbidden, errs.CodeAccKeyError, errs.CodeMissingApiKey,
+		errs.CodeCredsRequired, errs.CodeSignFail, errs.CodeParamInvalid:
+		return true
+	default:
+		return false
+	}
 }
 
 var (
@@ -271,6 +362,7 @@ func newWsClient(reqUrl, acc string, onMsg FuncOnWsMsg, onErr FuncOnWsErr, onClo
 	var result = &WsClient{
 		AccName:       acc,
 		URL:           reqUrl,
+		LogURL:        safeWebSocketURL(reqUrl, acc != ""),
 		Debug:         debug,
 		conns:         make(map[int]*AsyncConn),
 		JobInfos:      make(map[string]*WsJobInfo),
@@ -306,7 +398,7 @@ func newWsClient(reqUrl, acc string, onMsg FuncOnWsMsg, onErr FuncOnWsErr, onClo
 
 func (e *Exchange) GetClient(wsUrl string, marketType, accName string) (*WsClient, *errs.Error) {
 	clientKey := accName + "@" + wsUrl
-	client, ok := e.WSClients[clientKey]
+	client, ok := e.findWSClient(clientKey)
 	if ok {
 		conns, lock := client.LockConns()
 		connNum := len(conns)
@@ -339,11 +431,60 @@ func (e *Exchange) GetClient(wsUrl string, marketType, accName string) (*WsClien
 	client.Exg = e
 	client.MarketType = marketType
 	client.Key = clientKey
+	e.lockWSClient.Lock()
+	if current := e.WSClients[clientKey]; current != nil {
+		conns, lock := current.LockConns()
+		usable := len(conns) > 0
+		lock.Unlock()
+		if usable {
+			e.lockWSClient.Unlock()
+			client.Close()
+			return current, nil
+		}
+	}
 	e.WSClients[clientKey] = client
+	e.lockWSClient.Unlock()
 	if e.CheckWsTimeout != nil && !e.WsChecking {
 		go e.CheckWsTimeout()
 	}
 	return client, nil
+}
+
+func (e *Exchange) findWSClient(key string) (*WsClient, bool) {
+	e.lockWSClient.RLock()
+	client, ok := e.WSClients[key]
+	e.lockWSClient.RUnlock()
+	return client, ok
+}
+
+func (e *Exchange) FindWSClient(key string) (*WsClient, bool) {
+	return e.findWSClient(key)
+}
+
+func (e *Exchange) removeWSClient(client *WsClient) {
+	if client == nil {
+		return
+	}
+	e.lockWSClient.Lock()
+	if e.WSClients[client.Key] == client {
+		delete(e.WSClients, client.Key)
+	}
+	e.lockWSClient.Unlock()
+}
+
+func (e *Exchange) WSClientSnapshot() []*WsClient {
+	e.lockWSClient.RLock()
+	clients := utils.ValsOfMap(e.WSClients)
+	e.lockWSClient.RUnlock()
+	return clients
+}
+
+func (e *Exchange) drainWSClients() []*WsClient {
+	e.lockWSClient.Lock()
+	clients := utils.ValsOfMap(e.WSClients)
+	e.WSClients = make(map[string]*WsClient)
+	e.lockWSClient.Unlock()
+	return clients
 }
 
 /*
@@ -383,7 +524,7 @@ func WriteOutChan[T any](e *Exchange, chanKey string, msg T, popIfNeed bool) boo
 	out, ok := outRaw.(chan T)
 	if !ok {
 		e.lockOutChan.Unlock()
-		log.Error("out chan type error", zap.String("k", chanKey))
+		log.Error("out chan type error", zap.String("k", safeWsChannelKey(chanKey)))
 		return false
 	}
 	select {
@@ -393,7 +534,7 @@ func WriteOutChan[T any](e *Exchange, chanKey string, msg T, popIfNeed bool) boo
 	default:
 		if !popIfNeed {
 			e.lockOutChan.Unlock()
-			log.Error("out chan full", zap.String("k", chanKey))
+			log.Error("out chan full", zap.String("k", safeWsChannelKey(chanKey)))
 			return false
 		}
 		// chan通道满了，弹出最早的消息，重新发送
@@ -436,7 +577,7 @@ func (e *Exchange) DelWsChanRefs(chanKey string, keys ...string) int {
 				val.Close()
 			}
 			delete(e.WsOutChans, chanKey)
-			log.Info("remove chan", zap.String("key", chanKey))
+			log.Info("remove chan", zap.String("key", safeWsChannelKey(chanKey)))
 		}
 		e.lockOutChan.Unlock()
 	}
@@ -444,6 +585,7 @@ func (e *Exchange) DelWsChanRefs(chanKey string, keys ...string) int {
 }
 
 func (e *Exchange) handleWsClientClosed(client *WsClient) int {
+	e.removeWSClient(client)
 	prefix := client.Prefix("")
 	removeNum := 0
 	e.lockWsRef.Lock()
@@ -599,8 +741,8 @@ func (c *WsClient) Write(conn *AsyncConn, msg interface{}, info *WsJobInfo) *err
 		}
 	}
 	if c.Debug {
-		log.Debug("write ws msg", zap.String("url", c.URL), zap.Int("id", conn.GetID()),
-			zap.String("msg", string(data)))
+		log.Debug("write ws msg", zap.String("url", c.LogURL), zap.Int("id", conn.GetID()),
+			zap.ByteString("msg", redactJSONSecrets(data)))
 	}
 	conn.send <- data
 	return nil
@@ -612,8 +754,8 @@ func (c *WsClient) WriteRaw(conn *AsyncConn, data []byte) *errs.Error {
 		return nil
 	}
 	if c.Debug {
-		log.Debug("write ws raw", zap.String("url", c.URL), zap.Int("id", conn.GetID()),
-			zap.String("msg", string(data)))
+		log.Debug("write ws raw", zap.String("url", c.LogURL), zap.Int("id", conn.GetID()),
+			zap.ByteString("msg", redactJSONSecrets(data)))
 	}
 	conn.send <- data
 	return nil
@@ -631,7 +773,7 @@ func (c *WsClient) Close() {
 }
 
 func (c *WsClient) write(conn *AsyncConn) {
-	zapFields := []zap.Field{zap.String("url", c.URL), zap.Int("id", conn.GetID())}
+	zapFields := []zap.Field{zap.String("url", c.LogURL), zap.Int("id", conn.GetID())}
 	defer func() {
 		log.Debug("stop write ws", zapFields...)
 		err := conn.Close()
@@ -642,7 +784,11 @@ func (c *WsClient) write(conn *AsyncConn) {
 		conn.control = nil
 		c.connLock.Lock()
 		delete(c.conns, conn.GetID())
+		lastConn := len(c.conns) == 0
 		c.connLock.Unlock()
+		if lastConn {
+			c.Exg.removeWSClient(c)
+		}
 	}()
 	for {
 		select {
@@ -702,13 +848,13 @@ func (c *WsClient) read(conn *AsyncConn) {
 		msgRaw, err := conn.ReadMsg()
 		if err != nil {
 			if !conn.IsOK() {
-				log.Error("read fail, ws closed", zap.String("url", c.URL), zap.Int("id", conn.GetID()), zap.Error(err))
+				log.Error("read fail, ws closed", zap.String("url", c.LogURL), zap.Int("id", conn.GetID()), zap.Error(err))
 				if c.OnClose != nil {
 					c.OnClose(c, errs.New(errs.CodeWsReadFail, err))
 				}
 				return
 			} else {
-				log.Error("read error", zap.String("url", c.URL), zap.Int("id", conn.GetID()), zap.Error(err))
+				log.Error("read error", zap.String("url", c.LogURL), zap.Int("id", conn.GetID()), zap.Error(err))
 				if c.OnError != nil {
 					c.OnError(c, errs.New(errs.CodeWsReadFail, err))
 				}
@@ -719,7 +865,7 @@ func (c *WsClient) read(conn *AsyncConn) {
 		if c.Exg.WsDecoder == nil {
 			// We cannot start a goroutine for each message here, otherwise it will result in incorrect message processing order
 			// 这里不能对每个消息启动一个goroutine，否则会导致消息处理顺序错误
-			c.Exg.DumpWS("wsMsg", []string{c.URL, c.MarketType, c.AccName, string(msgRaw)})
+			c.Exg.DumpWS("wsMsg", []string{c.LogURL, c.MarketType, c.AccName, string(redactJSONSecrets(msgRaw))})
 			c.HandleRawMsg(msgRaw)
 		}
 	}
@@ -728,7 +874,7 @@ func (c *WsClient) read(conn *AsyncConn) {
 func (c *WsClient) HandleRawMsg(msgRaw []byte) {
 	msgText := string(msgRaw)
 	if c.Debug {
-		log.Debug("receive ws msg", zap.String("url", c.URL), zap.String("msg", msgText))
+		log.Debug("receive ws msg", zap.String("url", c.LogURL), zap.ByteString("msg", redactJSONSecrets(msgRaw)))
 	}
 	if msgText == "pong" {
 		return
@@ -739,7 +885,7 @@ func (c *WsClient) HandleRawMsg(msgRaw []byte) {
 		if c.OnError != nil {
 			c.OnError(c, err)
 		}
-		log.Error("invalid ws msg", zap.String("msg", msgText), zap.Error(err))
+		log.Error("invalid ws msg", zap.ByteString("msg", redactJSONSecrets(msgRaw)), zap.Error(err))
 		return
 	}
 	if !msg.IsArray && msg.ID != "" {
@@ -800,7 +946,7 @@ func (c *WsClient) UpdateSubs(connID int, isSub bool, keys []string) (string, *A
 			var err *errs.Error
 			conn, err = c.newConn(true)
 			if err != nil {
-				log.Warn("make new websocket fail", zap.String("url", c.URL), zap.String("err", err.Short()))
+				log.Warn("make new websocket fail", zap.String("url", c.LogURL), zap.String("err", err.Short()))
 			}
 		}
 		// Randomly select one from existing connections
@@ -869,13 +1015,13 @@ func (c *WsClient) HasSubKeyPrefix(prefix string) bool {
 
 func (c *WsClient) newConn(add bool) (*AsyncConn, *errs.Error) {
 	connID := c.NextConnId
-	conn, err := newWebSocket(connID, c.URL, c.connArgs, func() *errs.Error {
+	conn, err := newWebSocket(connID, c.URL, c.LogURL, c.connArgs, func() *errs.Error {
 		return c.OnReConn(c, connID)
 	})
 	if err != nil {
 		return nil, err
 	}
-	log.Debug("new websocket conn", zap.String("url", c.URL), zap.Int("id", conn.GetID()))
+	log.Debug("new websocket conn", zap.String("url", c.LogURL), zap.Int("id", conn.GetID()))
 	c.NextConnId += 1
 	if add {
 		c.addConn(conn)
@@ -905,6 +1051,106 @@ func (c *WsClient) LockConns() (map[int]*AsyncConn, *deadlock.Mutex) {
 func (c *WsClient) LockOdBookLimits() (map[string]int, *deadlock.Mutex) {
 	c.limitsLock.Lock()
 	return c.odBookLimits, &c.limitsLock
+}
+
+func safeWebSocketURL(raw string, credential bool) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "[redacted websocket URL]"
+	}
+	query := parsed.Query()
+	for key := range query {
+		if isSecretKey(key) {
+			query.Set(key, "[redacted]")
+		}
+	}
+	parsed.RawQuery = query.Encode()
+	if credential {
+		const marker = "/ws/"
+		if idx := strings.LastIndex(parsed.Path, marker); idx >= 0 && idx+len(marker) < len(parsed.Path) {
+			parsed.Path = parsed.Path[:idx+len(marker)] + "[redacted]"
+			parsed.RawPath = ""
+		}
+	}
+	return parsed.String()
+}
+
+func safeWsChannelKey(key string) string {
+	at := strings.IndexByte(key, '@')
+	hash := strings.LastIndexByte(key, '#')
+	if at < 0 || hash <= at {
+		return key
+	}
+	return key[:at+1] + safeWebSocketURL(key[at+1:hash], at > 0) + key[hash:]
+}
+
+func isSecretKey(key string) bool {
+	normalized := strings.NewReplacer("-", "", "_", "").Replace(strings.ToLower(key))
+	switch normalized {
+	case "listenkey", "listentoken", "apikey", "secret", "signature", "sign", "authorization":
+		return true
+	default:
+		return strings.Contains(normalized, "apikey") || strings.Contains(normalized, "accesskey")
+	}
+}
+
+func redactJSONSecrets(raw []byte) []byte {
+	var value interface{}
+	if json.Unmarshal(raw, &value) != nil {
+		return raw
+	}
+	redactSecretValue(value)
+	redacted, err := json.Marshal(value)
+	if err != nil {
+		return raw
+	}
+	return redacted
+}
+
+func redactRequestText(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	trimmed := strings.TrimSpace(raw)
+	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+		return string(redactJSONSecrets([]byte(raw)))
+	}
+	values, err := url.ParseQuery(raw)
+	if err != nil {
+		return raw
+	}
+	changed := false
+	for key := range values {
+		if isSecretKey(key) {
+			values.Set(key, "[redacted]")
+			changed = true
+		}
+	}
+	if !changed {
+		return raw
+	}
+	return values.Encode()
+}
+
+func RedactLogText(raw string) string {
+	return redactRequestText(raw)
+}
+
+func redactSecretValue(value interface{}) {
+	switch item := value.(type) {
+	case map[string]interface{}:
+		for key, child := range item {
+			if isSecretKey(key) {
+				item[key] = "[redacted]"
+			} else {
+				redactSecretValue(child)
+			}
+		}
+	case []interface{}:
+		for _, child := range item {
+			redactSecretValue(child)
+		}
+	}
 }
 
 func NewWsMsg(msgText string) (*WsMsg, *errs.Error) {

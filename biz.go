@@ -1263,8 +1263,8 @@ func (e *Exchange) RequestApi(ctx context.Context, cacheKey string, api *Entry, 
 	e.setReqHeaders(&req.Header)
 
 	if debug || e.DebugAPI {
-		log.Debug("request", zap.String(sign.Method, sign.Url),
-			zap.Object("header", HttpHeader(req.Header)), zap.String("body", sign.Body))
+		log.Debug("request", zap.String(sign.Method, safeWebSocketURL(sign.Url, false)),
+			zap.Object("header", HttpHeader(req.Header)), zap.String("body", redactRequestText(sign.Body)))
 	}
 	rsp, err := e.HttpClient.Do(req)
 	if err != nil {
@@ -1279,10 +1279,11 @@ func (e *Exchange) RequestApi(ctx context.Context, cacheKey string, api *Entry, 
 		return &result
 	}
 	result.Content = string(rspData)
-	cutLen := min(len(result.Content), 3000)
-	bodyShort := zap.String("body", result.Content[:cutLen])
+	safeContent := redactRequestText(result.Content)
+	cutLen := min(len(safeContent), 3000)
+	bodyShort := zap.String("body", safeContent[:cutLen])
 	if debug || e.DebugAPI {
-		log.Debug("rsp", zap.Int("status", result.Status), zap.String("url", sign.Url),
+		log.Debug("rsp", zap.Int("status", result.Status), zap.String("url", safeWebSocketURL(sign.Url, false)),
 			zap.Object("head", HttpHeader(result.Headers)),
 			zap.Int("len", len(result.Content)), bodyShort)
 	}
@@ -1788,10 +1789,9 @@ func (e *Exchange) Close() *errs.Error {
 		delete(e.WsOutChans, key)
 	}
 	e.lockOutChan.Unlock()
-	for _, client := range e.WSClients {
+	for _, client := range e.drainWSClients() {
 		client.Close()
 	}
-	e.WSClients = map[string]*WsClient{}
 	err := e.SetDump("")
 	if err != nil {
 		return err

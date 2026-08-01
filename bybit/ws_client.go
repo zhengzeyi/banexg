@@ -517,11 +517,11 @@ func makeCheckWsTimeout(e *Bybit) func() {
 		pingInterval := time.Second * 20
 		for {
 			time.Sleep(pingInterval)
-			for _, client := range e.WSClients {
+			for _, client := range e.WSClientSnapshot() {
 				conns, lock := client.LockConns()
 				for _, conn := range conns {
 					if err := client.Write(conn, map[string]interface{}{"op": "ping"}, nil); err != nil {
-						log.Warn("send bybit ws ping fail", zap.String("url", client.URL),
+						log.Warn("send bybit ws ping fail", zap.String("url", client.LogURL),
 							zap.Int("conn", conn.GetID()), zap.Error(err))
 					}
 				}

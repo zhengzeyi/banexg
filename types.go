@@ -74,19 +74,20 @@ type Exchange struct {
 	WsOutChans map[string]interface{}         // accName@url+msgHash: chan Type
 	WsChanRefs map[string]map[string]struct{} // accName@url+msgHash: symbols use this chan
 
-	WsCache     []*WsLog // websocket cache logs waiting for replay/dump
-	WsNextMS    int64    // timestamp of next replay log
-	WsReplayTo  int64    // timestamp of latest replay log
-	WsFile      *os.File // file to replay/dump
-	WsWriter    *gzip.Writer
-	WsEncoder   *gob.Encoder
-	WsReader    *gzip.Reader
-	WsDecoder   *gob.Decoder
-	WsBatchSize int
-	WsReplayFn  map[string]func(item *WsLog) *errs.Error
-	wsCacheLock deadlock.Mutex
-	lockWsRef   deadlock.Mutex
-	lockOutChan deadlock.Mutex
+	WsCache      []*WsLog // websocket cache logs waiting for replay/dump
+	WsNextMS     int64    // timestamp of next replay log
+	WsReplayTo   int64    // timestamp of latest replay log
+	WsFile       *os.File // file to replay/dump
+	WsWriter     *gzip.Writer
+	WsEncoder    *gob.Encoder
+	WsReader     *gzip.Reader
+	WsDecoder    *gob.Decoder
+	WsBatchSize  int
+	WsReplayFn   map[string]func(item *WsLog) *errs.Error
+	wsCacheLock  deadlock.Mutex
+	lockWSClient deadlock.RWMutex
+	lockWsRef    deadlock.Mutex
+	lockOutChan  deadlock.Mutex
 
 	KeyTimeStamps map[string]int64 // key: int64 更新的时间戳
 

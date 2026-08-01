@@ -64,7 +64,7 @@ func makeHandleWsMsg(e *OKX) banexg.FuncOnWsMsg {
 				return
 			}
 			if event == "error" {
-				log.Error("ws event error", zap.String("msg", item.Text))
+				log.Error("ws event error", zap.String("msg", banexg.RedactLogText(item.Text)))
 				// Check if this is a login-related error
 				code := getMapString(msg, "code")
 				if code == "60011" || code == "60009" || code == "60012" {
@@ -113,7 +113,7 @@ func makeHandleWsReCon(e *OKX) banexg.FuncOnWsReCon {
 			return nil
 		}
 		keys := client.GetSubKeys(connID)
-		if client.MarketType == wsPrivate {
+		if client.MarketType == wsPrivate || client.MarketType == wsBusiness && client.AccName != "" {
 			// Clear auth state on reconnect to force re-login
 			e.WsAuthLock.Lock()
 			delete(e.WsAuthed, client.Key)
@@ -1024,7 +1024,7 @@ func (e *OKX) hasPositionsSubscription(client *banexg.WsClient) bool {
 		return false
 	}
 	// Check all WebSocket clients for positions channel subscription
-	for _, c := range e.WSClients {
+	for _, c := range e.WSClientSnapshot() {
 		if c.AccName != client.AccName {
 			continue
 		}
@@ -1662,12 +1662,12 @@ func makeCheckWsTimeout(e *OKX) func() {
 		pingInterval := time.Second * 20
 		for {
 			time.Sleep(pingInterval)
-			for _, client := range e.WSClients {
+			for _, client := range e.WSClientSnapshot() {
 				conns, lock := client.LockConns()
 				for _, conn := range conns {
 					// Send raw "ping" string to keep connection alive
 					if err := client.WriteRaw(conn, pingData); err != nil {
-						log.Warn("send ping fail", zap.String("url", client.URL),
+						log.Warn("send ping fail", zap.String("url", client.LogURL),
 							zap.Int("conn", conn.GetID()), zap.Error(err))
 					}
 				}
