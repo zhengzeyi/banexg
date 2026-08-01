@@ -71,6 +71,9 @@ func (e *Error) Message() string {
 }
 
 func (e *Error) Unwrap() error {
+	if e == nil {
+		return nil
+	}
 	return e.err
 }
 

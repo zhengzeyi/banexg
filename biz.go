@@ -1178,6 +1178,24 @@ func (e *Exchange) setReqHeaders(head *http.Header) {
 	}
 }
 
+func waitRequestContext(ctx context.Context, duration time.Duration) error {
+	if duration <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func requestContextError(ctx context.Context) *HttpRes {
+	return &HttpRes{Error: errs.New(errs.CodeTimeout, ctx.Err())}
+}
+
 /*
 RequestApi
 Request exchange API without checking cache
@@ -1194,7 +1212,11 @@ func (e *Exchange) RequestApi(ctx context.Context, cacheKey string, api *Entry, 
 	// Traffic control, block if concurrency is full
 	// 流量控制，如果并发已满则阻塞
 	sem := GetHostFlowChan(api.RawHost)
-	sem <- struct{}{}
+	select {
+	case sem <- struct{}{}:
+	case <-ctx.Done():
+		return requestContextError(ctx)
+	}
 	defer func() {
 		<-sem
 	}()
@@ -1202,7 +1224,9 @@ func (e *Exchange) RequestApi(ctx context.Context, cacheKey string, api *Entry, 
 	// 检查是否出现429或418需要等待
 	waitMS := GetHostRetryWait(api.RawHost, true)
 	if waitMS > 0 {
-		time.Sleep(time.Millisecond * time.Duration(waitMS))
+		if err := waitRequestContext(ctx, time.Millisecond*time.Duration(waitMS)); err != nil {
+			return requestContextError(ctx)
+		}
 	}
 	if e.EnableRateLimit == BoolTrue {
 		e.rateM.Lock()
@@ -1210,7 +1234,10 @@ func (e *Exchange) RequestApi(ctx context.Context, cacheKey string, api *Entry, 
 		cost := e.CalcRateLimiterCost(api, params)
 		sleepMS := int64(math.Round(float64(e.RateLimit) * cost))
 		if elapsed < sleepMS {
-			time.Sleep(time.Duration(sleepMS-elapsed) * time.Millisecond)
+			if err := waitRequestContext(ctx, time.Duration(sleepMS-elapsed)*time.Millisecond); err != nil {
+				e.rateM.Unlock()
+				return requestContextError(ctx)
+			}
 		}
 		e.lastRequestMS = e.MilliSeconds()
 		e.rateM.Unlock()
@@ -1236,8 +1263,8 @@ func (e *Exchange) RequestApi(ctx context.Context, cacheKey string, api *Entry, 
 	e.setReqHeaders(&req.Header)
 
 	if debug || e.DebugAPI {
-		log.Debug("request", zap.String(sign.Method, sign.Url),
-			zap.Object("header", HttpHeader(req.Header)), zap.String("body", sign.Body))
+		log.Debug("request", zap.String(sign.Method, safeWebSocketURL(sign.Url, false)),
+			zap.Object("header", HttpHeader(req.Header)), zap.String("body", redactRequestText(sign.Body)))
 	}
 	rsp, err := e.HttpClient.Do(req)
 	if err != nil {
@@ -1252,10 +1279,11 @@ func (e *Exchange) RequestApi(ctx context.Context, cacheKey string, api *Entry, 
 		return &result
 	}
 	result.Content = string(rspData)
-	cutLen := min(len(result.Content), 3000)
-	bodyShort := zap.String("body", result.Content[:cutLen])
+	safeContent := redactRequestText(result.Content)
+	cutLen := min(len(safeContent), 3000)
+	bodyShort := zap.String("body", safeContent[:cutLen])
 	if debug || e.DebugAPI {
-		log.Debug("rsp", zap.Int("status", result.Status), zap.String("url", sign.Url),
+		log.Debug("rsp", zap.Int("status", result.Status), zap.String("url", safeWebSocketURL(sign.Url, false)),
 			zap.Object("head", HttpHeader(result.Headers)),
 			zap.Int("len", len(result.Content)), bodyShort)
 	}
@@ -1389,7 +1417,10 @@ func (e *Exchange) RequestApiRetryAdv(ctx context.Context, endpoint string, para
 	var sleep = 0
 	for i := 0; i < tryNum; i++ {
 		if sleep > 0 {
-			time.Sleep(time.Second * time.Duration(sleep))
+			if err := waitRequestContext(ctx, time.Second*time.Duration(sleep)); err != nil {
+				rsp = requestContextError(ctx)
+				break
+			}
 			sleep = 0
 		}
 		rsp = e.RequestApi(ctx, cacheKey, api, params, writeCache, debug)
@@ -1758,10 +1789,9 @@ func (e *Exchange) Close() *errs.Error {
 		delete(e.WsOutChans, key)
 	}
 	e.lockOutChan.Unlock()
-	for _, client := range e.WSClients {
+	for _, client := range e.drainWSClients() {
 		client.Close()
 	}
-	e.WSClients = map[string]*WsClient{}
 	err := e.SetDump("")
 	if err != nil {
 		return err
