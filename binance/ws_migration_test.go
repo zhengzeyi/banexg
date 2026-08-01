@@ -1,7 +1,9 @@
 package binance
 
 import (
+	"net/url"
 	"testing"
+	"time"
 
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/utils"
@@ -26,6 +28,67 @@ func TestLinearWsRoute(t *testing.T) {
 	}
 	if got := linearPrivateWsHost("wss://fstream.binance.com/ws"); got != "wss://fstream.binance.com/private/ws" {
 		t.Fatalf("linearPrivateWsHost() = %q", got)
+	}
+}
+
+func TestLinearUserDataWsURL(t *testing.T) {
+	got := linearUserDataWsURL("wss://fstream.binance.com/ws", "listen-key")
+	parsed, err := url.Parse(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Path != "/private/ws" {
+		t.Fatalf("path = %q, want /private/ws", parsed.Path)
+	}
+	query := parsed.Query()
+	if query.Get("listenKey") != "listen-key" {
+		t.Fatalf("listenKey = %q", query.Get("listenKey"))
+	}
+	if query.Get("events") != linearUserDataEvents {
+		t.Fatalf("events = %q, want %q", query.Get("events"), linearUserDataEvents)
+	}
+}
+
+func TestListenKeyRetryDelay(t *testing.T) {
+	want := []time.Duration{3 * time.Second, 6 * time.Second, 12 * time.Second, 30 * time.Second, 30 * time.Second}
+	for attempt, expected := range want {
+		if got := listenKeyRetryDelay(attempt); got != expected {
+			t.Fatalf("attempt %d: got %s, want %s", attempt, got, expected)
+		}
+	}
+}
+
+func TestAlgoOrderUpdateLinksTriggeredTrade(t *testing.T) {
+	exg, err := New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &banexg.WsClient{AccName: "acc", Key: "acc@old-listen-key", MarketType: banexg.MarketLinear}
+	exg.handleAlgoOrderUpdate(client, map[string]string{
+		"o": `{"aid":2148719,"ai":"1087109971","s":"BNBUSDT","X":"TRIGGERED"}`,
+	})
+	rotatedClient := &banexg.WsClient{AccName: "acc", Key: "acc@new-listen-key", MarketType: banexg.MarketLinear}
+	trade := banexg.MyTrade{
+		Trade: banexg.Trade{Order: "1087109971", Symbol: "BNBUSDT"},
+		State: banexg.OdStatusFilled,
+	}
+	exg.linkAlgoOrder(rotatedClient, &trade)
+	if trade.AlgoId != "2148719" {
+		t.Fatalf("AlgoId = %q, want 2148719", trade.AlgoId)
+	}
+	again := banexg.MyTrade{Trade: banexg.Trade{Order: "1087109971", Symbol: "BNBUSDT"}}
+	exg.linkAlgoOrder(rotatedClient, &again)
+	if again.AlgoId != "" {
+		t.Fatalf("terminal mapping remains: %q", again.AlgoId)
+	}
+
+	exg.handleAlgoOrderUpdate(client, map[string]string{
+		"ao": `{"aid":99,"ai":"same-order","s":"ETHUSDT","X":"TRIGGERED"}`,
+	})
+	wrongSymbol := banexg.MyTrade{Trade: banexg.Trade{Order: "same-order", Symbol: "BNBUSDT"}}
+	exg.linkAlgoOrder(client, &wrongSymbol)
+	if wrongSymbol.AlgoId != "" {
+		t.Fatalf("mapping crossed symbols: %q", wrongSymbol.AlgoId)
 	}
 }
 

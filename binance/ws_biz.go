@@ -41,7 +41,7 @@ func makeHandleWsMsg(e *Binance) banexg.FuncOnWsMsg {
 					log.Debug("ws job ok", zap.String("job", item.ID))
 				}
 			} else {
-				log.Warn("no event ws msg", zap.String("msg", item.Text))
+				log.Warn("no event ws msg", zap.String("msg", banexg.RedactLogText(item.Text)))
 			}
 			return
 		}
@@ -90,11 +90,13 @@ func makeHandleWsMsg(e *Binance) banexg.FuncOnWsMsg {
 			e.handleOrderUpdate(client, msg)
 		case "ORDER_TRADE_UPDATE":
 			e.handleOrderUpdate(client, msg)
+		case "ALGO_UPDATE":
+			e.handleAlgoOrderUpdate(client, msg)
 		case "ACCOUNT_CONFIG_UPDATE":
 			e.handleAccountConfigUpdate(client, msg)
 		case "TRADE_LITE":
 		default:
-			log.Warn("unhandle ws msg", zap.String("msg", item.Text))
+			log.Warn("unhandle ws msg", zap.String("msg", banexg.RedactLogText(item.Text)))
 		}
 	}
 }
@@ -115,7 +117,7 @@ func makeHandleWsReCon(e *Binance) banexg.FuncOnWsReCon {
 		if len(subParams) == 0 {
 			return nil
 		}
-		zapFields := []zap.Field{zap.String("url", client.URL), zap.Int("id", connID),
+		zapFields := []zap.Field{zap.String("url", client.LogURL), zap.Int("id", connID),
 			zap.Int("job", len(subParams))}
 		log.Info("re-subscribe ws", zapFields...)
 		err := e.WriteWSMsg(client, connID, true, subParams, nil, nil)
@@ -168,10 +170,11 @@ func (e *Binance) postListenKey(acc *banexg.Account, params map[string]interface
 	lastTimeKey := marketType + "lastAuthTime"
 	authField := marketType + banexg.MidListenKey
 	lastAuthTime := utils.GetMapVal(acc.Data, lastTimeKey, zeroVal)
+	listenKey := utils.GetMapVal(acc.Data, authField, "")
 	authRefreshSecs := utils.GetMapVal(e.Options, banexg.OptAuthRefreshSecs, 1200)
 	refreshDuration := int64(authRefreshSecs * 1000)
 	curTime := e.MilliSeconds()
-	if curTime-lastAuthTime <= refreshDuration {
+	if listenKey != "" && curTime-lastAuthTime <= refreshDuration {
 		return nil
 	}
 	method := MethodPublicPostUserDataStream
@@ -191,7 +194,7 @@ func (e *Binance) postListenKey(acc *banexg.Account, params map[string]interface
 	if err2 != nil {
 		return errs.New(errs.CodeUnmarshalFail, err2)
 	}
-	listenKey := res.ListenKey
+	listenKey = res.ListenKey
 	if marketType == banexg.MarketMargin {
 		listenKey = res.ListenToken
 	}
@@ -212,6 +215,10 @@ func (e *Binance) postListenKey(acc *banexg.Account, params map[string]interface
 }
 
 func (e *Binance) keepAliveListenKey(acc *banexg.Account, params map[string]interface{}) {
+	e.keepAliveListenKeyRetry(acc, params, 0)
+}
+
+func (e *Binance) keepAliveListenKeyRetry(acc *banexg.Account, params map[string]interface{}, attempt int) {
 	args := utils.SafeParams(params)
 	marketType, _ := e.GetArgsMarketType(args, "")
 	if marketType == banexg.MarketMargin {
@@ -223,28 +230,12 @@ func (e *Binance) keepAliveListenKey(acc *banexg.Account, params map[string]inte
 	listenKey := utils.GetMapVal(acc.Data, authField, "")
 	acc.LockData.Unlock()
 	if listenKey == "" {
+		if err := e.postListenKey(acc, params); err != nil {
+			log.Error("post new listenKey fail", zap.Error(err))
+			e.scheduleListenKeyRetry(acc, params, attempt)
+		}
 		return
 	}
-	var success = false
-	defer func() {
-		if success {
-			return
-		}
-		acc.LockData.Lock()
-		delete(acc.Data, authField)
-		delete(acc.Data, lastTimeKey)
-		acc.LockData.Unlock()
-		clientKey := acc.Name + "@" + e.GetHost(marketType) + "/" + listenKey
-		if client, ok := e.WSClients[clientKey]; ok {
-			conns, lock := client.LockConns()
-			connList := utils.ValsOfMap(conns)
-			lock.Unlock()
-			for _, conn := range connList {
-				_ = conn.WriteClose()
-			}
-			log.Warn("renew listenKey fail, close ws client", zap.String("key", clientKey))
-		}
-	}()
 	method := MethodPublicPutUserDataStream
 	if marketType == banexg.MarketLinear {
 		method = MethodFapiPrivatePutListenKey
@@ -256,26 +247,59 @@ func (e *Binance) keepAliveListenKey(acc *banexg.Account, params map[string]inte
 	rsp := e.RequestApiRetry(context.Background(), method, args, 1)
 	if rsp.Error != nil {
 		if rsp.Error.Code == errs.CodeStreamExpired || rsp.Error.Code == errs.CodeExchangeError {
+			acc.LockData.Lock()
+			if utils.GetMapVal(acc.Data, authField, "") == listenKey {
+				delete(acc.Data, authField)
+				delete(acc.Data, lastTimeKey)
+			}
+			acc.LockData.Unlock()
+			e.closeUserDataClient(acc, marketType, listenKey)
 			err := e.postListenKey(acc, params)
 			if err != nil {
 				log.Error("post new listenKey fail", zap.Error(err))
-				return
+				e.scheduleListenKeyRetry(acc, params, attempt)
 			}
-			success = true
 			return
 		}
 		log.Error("refresh listenKey fail", zap.Error(rsp.Error))
+		e.scheduleListenKeyRetry(acc, params, attempt)
 		return
 	}
-	success = true
 	acc.LockData.Lock()
 	acc.Data[lastTimeKey] = e.MilliSeconds()
-	authRefreshSecs := utils.GetMapVal(acc.Data, banexg.OptAuthRefreshSecs, 1200)
 	acc.LockData.Unlock()
+	authRefreshSecs := utils.GetMapVal(e.Options, banexg.OptAuthRefreshSecs, 1200)
 	refreshDuration := time.Duration(authRefreshSecs) * time.Second
 	time.AfterFunc(refreshDuration, func() {
 		e.keepAliveListenKey(acc, params)
 	})
+}
+
+func (e *Binance) scheduleListenKeyRetry(acc *banexg.Account, params map[string]interface{}, attempt int) {
+	time.AfterFunc(listenKeyRetryDelay(attempt), func() {
+		e.keepAliveListenKeyRetry(acc, params, attempt+1)
+	})
+}
+
+func listenKeyRetryDelay(attempt int) time.Duration {
+	delays := [...]time.Duration{3 * time.Second, 6 * time.Second, 12 * time.Second, 30 * time.Second}
+	return delays[min(attempt, len(delays)-1)]
+}
+
+func (e *Binance) closeUserDataClient(acc *banexg.Account, marketType, listenKey string) {
+	clientKey := acc.Name + "@" + e.userDataWsURL(marketType, listenKey)
+	client, ok := e.FindWSClient(clientKey)
+	if !ok {
+		return
+	}
+	conns, lock := client.LockConns()
+	connList := utils.ValsOfMap(conns)
+	lock.Unlock()
+	for _, conn := range connList {
+		_ = conn.Close()
+	}
+	log.Warn("renew listenKey fail, close ws client", zap.String("account", acc.Name),
+		zap.String("url", client.LogURL))
 }
 
 func (e *Binance) getAuthClient(params map[string]interface{}) (string, *banexg.WsClient, *errs.Error) {
@@ -296,10 +320,8 @@ func (e *Binance) getAuthClient(params map[string]interface{}) (string, *banexg.
 	acc.LockData.Lock()
 	listenKey := utils.GetMapVal(acc.Data, marketType+banexg.MidListenKey, "")
 	acc.LockData.Unlock()
-	wsUrl := e.GetHost(marketType) + "/" + listenKey
-	if marketType == banexg.MarketLinear {
-		wsUrl = linearPrivateWsHost(e.GetHost(marketType)) + "/" + listenKey
-	} else if marketType == banexg.MarketMargin {
+	wsUrl := e.userDataWsURL(marketType, listenKey)
+	if marketType == banexg.MarketMargin {
 		wsUrl = e.GetHost(WssApi)
 	}
 	client, err := e.GetClient(wsUrl, marketType, acc.Name)
@@ -307,6 +329,14 @@ func (e *Binance) getAuthClient(params map[string]interface{}) (string, *banexg.
 		err = e.subscribeMarginUserData(client, 0, listenKey)
 	}
 	return listenKey, client, err
+}
+
+func (e *Binance) userDataWsURL(marketType, listenKey string) string {
+	host := e.GetHost(marketType)
+	if marketType == banexg.MarketLinear {
+		return linearUserDataWsURL(host, listenKey)
+	}
+	return host + "/" + listenKey
 }
 
 func (e *Binance) subscribeMarginUserData(client *banexg.WsClient, connID int, listenToken string) *errs.Error {
@@ -851,6 +881,7 @@ func (e *Binance) handleOrderUpdate(client *banexg.WsClient, msg map[string]stri
 		msg = utils.MapValStr(obj)
 	}
 	trade := parseMyTrade(msg)
+	e.linkAlgoOrder(client, &trade)
 	market := e.GetMarketById(trade.Symbol, client.MarketType)
 	if market == nil {
 		log.Error("no market found for my trade", zap.String("symbol", trade.Symbol))
@@ -862,6 +893,51 @@ func (e *Binance) handleOrderUpdate(client *banexg.WsClient, msg map[string]stri
 	}
 
 	banexg.WriteOutChan(e.Exchange, client.Prefix("mytrades"), &trade, false)
+}
+
+func (e *Binance) handleAlgoOrderUpdate(client *banexg.WsClient, msg map[string]string) {
+	objText, _ := utils.SafeMapVal(msg, "o", "")
+	if objText == "" {
+		objText, _ = utils.SafeMapVal(msg, "ao", "")
+	}
+	if objText == "" {
+		return
+	}
+	var obj map[string]interface{}
+	if err := utils.UnmarshalString(objText, &obj, utils.JsonNumStr); err != nil {
+		log.Error("unmarshal ALGO_UPDATE fail", zap.String("o", objText), zap.Error(err))
+		return
+	}
+	data := utils.MapValStr(obj)
+	actualID, _ := utils.SafeMapVal(data, "ai", "")
+	algoID, _ := utils.SafeMapVal(data, "aid", "")
+	symbol, _ := utils.SafeMapVal(data, "s", "")
+	if actualID == "" || algoID == "" || symbol == "" {
+		return
+	}
+	e.algoOrderLock.Lock()
+	if e.algoOrderIDs == nil {
+		e.algoOrderIDs = make(map[string]string)
+	}
+	e.algoOrderIDs[algoOrderKey(client, symbol, actualID)] = algoID
+	e.algoOrderLock.Unlock()
+}
+
+func (e *Binance) linkAlgoOrder(client *banexg.WsClient, trade *banexg.MyTrade) {
+	if trade == nil || trade.Order == "" {
+		return
+	}
+	key := algoOrderKey(client, trade.Symbol, trade.Order)
+	e.algoOrderLock.Lock()
+	trade.AlgoId = e.algoOrderIDs[key]
+	if banexg.IsOrderDone(trade.State) {
+		delete(e.algoOrderIDs, key)
+	}
+	e.algoOrderLock.Unlock()
+}
+
+func algoOrderKey(client *banexg.WsClient, symbol, orderID string) string {
+	return client.AccName + "#" + client.MarketType + "#" + symbol + "#" + orderID
 }
 
 func (e *Binance) handleAccountConfigUpdate(client *banexg.WsClient, msg map[string]string) {

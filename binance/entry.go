@@ -847,6 +847,7 @@ func New(Options map[string]interface{}) (*Binance, *errs.Error) {
 			banexg.OdTypeMarket: "FULL",
 			banexg.OdTypeLimit:  "FULL",
 		},
+		algoOrderIDs: make(map[string]string),
 	}
 	exg.Sign = makeSign(exg)
 	exg.FetchCurrencies = makeFetchCurr(exg)

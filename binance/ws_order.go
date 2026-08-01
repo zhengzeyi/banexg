@@ -3,14 +3,16 @@ package binance
 import (
 	"errors"
 	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
+
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
 	"github.com/banbox/banexg/utils"
 	"github.com/banbox/bntp"
 	"go.uber.org/zap"
-	"strconv"
-	"strings"
 )
 
 var (
@@ -21,6 +23,7 @@ const (
 	linearWsRoutePublic  = "public"
 	linearWsRouteMarket  = "market"
 	linearWsRoutePrivate = "private"
+	linearUserDataEvents = "ORDER_TRADE_UPDATE/ACCOUNT_UPDATE/ACCOUNT_CONFIG_UPDATE/ALGO_UPDATE/MARGIN_CALL/listenKeyExpired"
 )
 
 func (e *Binance) Stream(marType, subHash string) string {
@@ -75,6 +78,14 @@ func linearWsRoute(msgHash string) string {
 
 func linearPrivateWsHost(host string) string {
 	return linearWsHost(host, linearWsRoutePrivate)
+}
+
+func linearUserDataWsURL(host, listenKey string) string {
+	query := url.Values{
+		"listenKey": {listenKey},
+		"events":    {linearUserDataEvents},
+	}
+	return linearPrivateWsHost(host) + "?" + query.Encode()
 }
 
 /*
@@ -365,7 +376,7 @@ func (e *Binance) handleOrderBook(client *banexg.WsClient, msg map[string]string
 	marketId, _ := msg["s"]
 	client.SetSubsKeyStamp(strings.ToLower(marketId)+"@depth", bntp.UTCStamp())
 	market := e.GetMarketById(marketId, client.MarketType)
-	urlZap := zap.String("url", client.URL)
+	urlZap := zap.String("url", client.LogURL)
 	if market == nil {
 		log.Error("no market for ws depth update", urlZap, zap.String("symbol", marketId))
 		return

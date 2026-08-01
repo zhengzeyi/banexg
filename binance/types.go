@@ -3,6 +3,7 @@ package binance
 import (
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
+	"github.com/sasha-s/go-deadlock"
 )
 
 type Binance struct {
@@ -14,6 +15,8 @@ type Binance struct {
 	streamLimits     map[string]int                // marketType: limit
 	wsRequestId      map[string]int                // url: count
 	LeverageBrackets map[string]*SymbolLvgBrackets // symbol: Leverage Brackets
+	algoOrderIDs     map[string]string             // ws client + actual order ID: algo ID
+	algoOrderLock    deadlock.Mutex
 }
 
 /*
